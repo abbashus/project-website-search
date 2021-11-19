@@ -10,7 +10,6 @@ import requests
 from botocore.exceptions import ClientError
 from opensearchpy import OpenSearch, helpers
 
-
 BASE_ENDPOINT = os.environ['API_GATEWAY_ENDPOINT']  # https://<10-digit-id>.execute-api.<region>.amazonaws.com
 PROXY_ENDPOINT = BASE_ENDPOINT + '/prod/opensearch'
 INDEX_NAME_PREFIX = 'documentation_index'
@@ -94,7 +93,7 @@ def index_mappings():
         "analyzer": "html_analyzer",
         "search_analyzer": "standard"
       },
-      "collection" : {"type": "text"},
+      "collection": {"type": "text"},
       "version": {"type": "keyword"},
       "summary": {
         "type": "text",
@@ -150,17 +149,25 @@ def create_index_name_from_prefix(prefix=INDEX_NAME_PREFIX):
 
 def yield_docs(bucket, base_path, current_version, index_name):
   s3 = boto3.client('s3')  # picks up the same region where this Lambda is deployed
-  index_file_key = base_path + '/search-index.json'
-  obj = s3.get_object(Bucket=bucket, Key=index_file_key)
-  docs_json = json.loads(obj['Body'].read().decode('utf-8'))
-  # let the json.JSONDecodeError go through to calling function
 
-  for doc in docs_json:
-    doc['version'] = current_version
-    yield {
-      "_index": index_name,
-      "_source": doc
-    }
+  if base_path and base_path.strip():
+    index_file_key = base_path + '/search-index.json'
+  else:
+    index_file_key = 'search-index.json'
+
+  try:
+    obj = s3.get_object(Bucket=bucket, Key=index_file_key)
+    docs_json = json.loads(obj['Body'].read().decode('utf-8'))
+    # let the json.JSONDecodeError go through to calling function
+
+    for doc in docs_json:
+      doc['version'] = current_version
+      yield {
+        "_index": index_name,
+        "_source": doc
+      }
+  except Exception as e:
+    print("Failed to parse " + index_file_key + ": ", e)
 
 
 def send_success_to_pipeline(pipeline, job_id):
@@ -183,10 +190,10 @@ def send_failure_to_pipeline(pipeline, job_id, message, invoke_id):
 
 
 def do_indexing(os_client, user_params):
-
   base_path = user_params['DESTINATION_KEY']
-  current_version = user_params['CURRENT_VERSION']
-  bucket = user_params['BUCKET_NAME']
+  current_version = user_params.get('CURRENT_VERSION')  # user_params['CURRENT_VERSION']
+  bucket = user_params['DESTINATION_BUCKET']
+  doc_type = user_params['DOC_TYPE']
 
   print("Creating a new index")
   new_index = create_index_name_from_prefix()
@@ -242,6 +249,39 @@ def do_indexing(os_client, user_params):
       }
     }
 
+    if doc_type == 'WWW':
+      delete_query = {
+        'query': {
+          "bool": {
+            "must_not": [
+              {
+                "term": {
+                  "type": "DOCS"
+                }
+              }
+            ]
+          }
+        }
+      }
+    else:
+      delete_query = {
+        'query': {
+          'bool': {
+            'must': [
+              {
+                'term': {
+                  'version': current_version
+                }
+              }, {
+                'term': {
+                  'type': 'DOCS'
+                }
+              }
+            ]
+          }
+        }
+      }
+
     delete_docs_status = os_client.delete_by_query(new_index, body=delete_query)
     print("Document deletion response: ", delete_docs_status)
     # delete_status['deleted'] > 0 should be true, else attempt deleting again ?
@@ -272,7 +312,6 @@ def do_indexing(os_client, user_params):
 
 
 def handler(event, context):
-
   job_id = event['CodePipeline.job']['id']
   user_params = json.loads(event['CodePipeline.job']['data']['actionConfiguration']['configuration']['UserParameters'])
   invoke_id = "abcde12345"  # context.invokeid
@@ -280,7 +319,7 @@ def handler(event, context):
   pipeline = boto3.client('codepipeline')
 
   try:
-    secret_manager = SecretManager("prod/website-search/indexer-credentials")
+    secret_manager = SecretManager("<secret-name-goes-here>")
     secret_manager.fetch_secret()
 
     os_client = OpenSearch([PROXY_ENDPOINT], http_auth=(secret_manager.get_username(), secret_manager.get_password()))
